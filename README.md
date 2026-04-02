@@ -4,6 +4,8 @@
 
 Provides Homebridge control for Mammotion mowers using the `PyMammotion` stack used by the Home Assistant integration.
 
+This plugin was heavily informed by the Mammotion Home Assistant work from `mikey0000` and by the Reddit guide showing Mammotion Yuka zone selection in Apple Home.
+
 ## Features
 
 - Discovers Mammotion mower devices from your account
@@ -82,6 +84,11 @@ npm run build
 - A dedicated Mammotion account shared to your mower devices is the safest setup.
 - BLE-only control is not implemented.
 - Matter robotic vacuum mode depends on a Matter-capable Homebridge runtime with Matter enabled.
+
+## Credits
+
+- Built on ideas and behavior from the [Mammotion Home Assistant integration](https://github.com/mikey0000/Mammotion-HA) by `mikey0000`.
+- Also inspired by the Reddit post [Mammotion Yuka in Apple Home with zone selection - Full working guide (HAMH Alpha)](https://www.reddit.com/r/HomeKit/comments/1rkvbyu/mammotion_yuka_in_apple_home_with_zone_selection/), which explicitly credits the Mammotion HA integration as the basis for that setup.
 
 ## License
 

@@ -203,7 +203,7 @@ export class MammotionClient extends EventEmitter {
 
     if (!probe.hasPyMammotion) {
       if (this.userConfiguredPythonPath) {
-        const installHint = `${this.pythonPath} -m pip install --upgrade pip pymammotion==0.5.75`;
+        const installHint = `${this.pythonPath} -m pip install --upgrade pip pymammotion==0.5.75 "betterproto2>=0.9,<0.10"`;
         throw new Error(
           [
             `Python found at ${probe.executable ?? this.pythonPath} but module "pymammotion" is missing.`,

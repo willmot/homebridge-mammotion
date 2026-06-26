@@ -43,6 +43,12 @@
         "minimum": 5,
         "maximum": 120
       },
+      "requestTimeoutSeconds": {
+        "title": "Bridge request timeout (seconds)",
+        "type": "integer",
+        "minimum": 1,
+        "description": "Optional override for how long to wait for a bridge response before failing the request. Applies to all methods except shutdown (which always uses a short timeout). Leave unset to use sensible per-method defaults."
+      },
       "offCommand": {
         "title": "Off command",
         "type": "string",

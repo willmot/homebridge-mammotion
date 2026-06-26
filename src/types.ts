@@ -6,6 +6,7 @@ export interface MammotionPlatformConfig {
   areaNameFallbacks?: Record<string, string[]>;
   pythonPath?: string;
   pollIntervalSeconds?: number;
+  requestTimeoutSeconds?: number;
   deviceFilter?: string[];
   offCommand?: 'pause' | 'dock' | 'cancel';
   enableMatterRvc?: boolean;

@@ -31,6 +31,7 @@ export class MammotionPlatform implements DynamicPlatformPlugin {
   private readonly cachedMatterAccessories = new Map<string, unknown>();
   private readonly pollingSeconds: number;
   private pollTimer?: NodeJS.Timeout;
+  private polling = false;
   private started = false;
   private readonly client: MammotionClient;
   private readonly usingMatterRvc: boolean;
@@ -43,7 +44,8 @@ export class MammotionPlatform implements DynamicPlatformPlugin {
   ) {
     const typedConfig = config as MammotionPlatformConfig;
     this.config = typedConfig;
-    this.pollingSeconds = Math.max(5, typedConfig.pollIntervalSeconds ?? 15);
+    const rawInterval = Number(typedConfig.pollIntervalSeconds);
+    this.pollingSeconds = Number.isFinite(rawInterval) ? Math.min(120, Math.max(5, Math.round(rawInterval))) : 15;
     this.client = new MammotionClient(log, typedConfig);
     this.usingMatterRvc = this.shouldUseMatterRvc();
     this.uuidNamespace = this.buildUuidNamespace();
@@ -199,22 +201,32 @@ export class MammotionPlatform implements DynamicPlatformPlugin {
   }
 
   private async pollOnce(): Promise<void> {
-    const states = await this.client.pollStates();
-    if (this.usingMatterRvc) {
-      await Promise.all(states.map(async state => {
-        const handler = this.matterHandlers.get(state.name);
-        if (handler) {
-          await handler.updateState(state);
-        }
-      }));
+    if (this.polling) {
+      this.log.debug('Skipping poll: previous poll still in flight');
       return;
     }
 
-    for (const state of states) {
-      const handler = this.handlers.get(state.name);
-      if (handler) {
-        handler.updateState(state);
+    this.polling = true;
+    try {
+      const states = await this.client.pollStates();
+      if (this.usingMatterRvc) {
+        await Promise.all(states.map(async state => {
+          const handler = this.matterHandlers.get(state.name);
+          if (handler) {
+            await handler.updateState(state);
+          }
+        }));
+        return;
       }
+
+      for (const state of states) {
+        const handler = this.handlers.get(state.name);
+        if (handler) {
+          handler.updateState(state);
+        }
+      }
+    } finally {
+      this.polling = false;
     }
   }
 

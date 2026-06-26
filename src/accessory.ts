@@ -107,8 +107,21 @@ export class MammotionAccessory {
       ? 'start'
       : (this.platform.config.offCommand ?? 'pause');
 
-    const updated = await this.client.command(this.device.name, action);
-    this.updateState(updated);
+    try {
+      const updated = await this.client.command(this.device.name, action);
+      this.updateState(updated);
+    } catch (error) {
+      this.platform.log.warn(
+        `Command '${action}' for ${this.device.name} failed: ${(error as Error).message}`,
+      );
+      this.switchService.updateCharacteristic(
+        this.platform.Characteristic.On,
+        this.isMowing(this.state),
+      );
+      throw new this.platform.api.hap.HapStatusError(
+        this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE,
+      );
+    }
   }
 
   private isMowing(state: MammotionState): boolean {

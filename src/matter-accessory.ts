@@ -99,22 +99,18 @@ export class MammotionMatterVacuum {
       handlers: {
         rvcRunMode: {
           changeToMode: async (request: { newMode: number }) => {
-            if (request.newMode === 1) {
-              await this.client.command(this.device.name, 'start');
-            } else {
-              await this.client.command(this.device.name, 'dock');
-            }
+            await this.runCommand(request.newMode === 1 ? 'start' : 'dock');
           },
         },
         rvcOperationalState: {
           pause: async () => {
-            await this.client.command(this.device.name, 'pause');
+            await this.runCommand('pause');
           },
           resume: async () => {
-            await this.client.command(this.device.name, 'start');
+            await this.runCommand('start');
           },
           goHome: async () => {
-            await this.client.command(this.device.name, 'dock');
+            await this.runCommand('dock');
           },
         },
       },
@@ -174,6 +170,16 @@ export class MammotionMatterVacuum {
 
   logReady(): void {
     this.log.info(`Matter RVC ready for ${this.device.name}`);
+  }
+
+  private async runCommand(action: 'start' | 'pause' | 'dock' | 'cancel'): Promise<void> {
+    try {
+      await this.client.command(this.device.name, action);
+    } catch (error) {
+      this.log.warn(
+        `Matter command '${action}' for ${this.device.name} failed: ${(error as Error).message}`,
+      );
+    }
   }
 
   private isWorking(state: MammotionState): boolean {

@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import type { Logger } from 'homebridge';
 
 const REQUIRED_MAJOR = 3;
-const REQUIRED_MINOR = 10;
+// PYMAMMOTION_SPEC requires Python >= 3.12, so the managed runtime must be 3.12+.
+const REQUIRED_MINOR = 12;
 const PYMAMMOTION_SPEC = 'pymammotion==0.5.75';
 
 export type PythonProbe = {
@@ -122,7 +123,7 @@ export async function bootstrapManagedPython(log: Logger): Promise<string> {
   if (!selectedPython) {
     throw new Error(
       [
-        'No compatible Python 3.10+ interpreter found to bootstrap managed PyMammotion runtime.',
+        'No compatible Python 3.12+ interpreter found to bootstrap managed PyMammotion runtime.',
         `Candidates checked: ${candidates.join(', ')}`,
         `Probe failures: ${failures.join(' | ')}`,
       ].join(' '),

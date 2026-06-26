@@ -197,7 +197,7 @@ export class MammotionClient extends EventEmitter {
 
     if (!versionIsSupported(probe)) {
       throw new Error(
-        `Python ${versionLabel(probe)} at ${probe.executable ?? this.pythonPath} is unsupported. Use Python 3.10+ or remove "pythonPath" to use managed runtime.`,
+        `Python ${versionLabel(probe)} at ${probe.executable ?? this.pythonPath} is unsupported. Use Python 3.12+ or remove "pythonPath" to use managed runtime.`,
       );
     }
 

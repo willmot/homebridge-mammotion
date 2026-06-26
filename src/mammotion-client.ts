@@ -21,7 +21,19 @@ import {
 type Pending = {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
+  timer?: NodeJS.Timeout;
 };
+
+const REQUEST_TIMEOUTS_MS: Record<string, number> = {
+  init: 120000,
+  command: 60000,
+  poll: 30000,
+  shutdown: 5000,
+};
+
+const DEFAULT_REQUEST_TIMEOUT_MS = 60000;
+
+const MAX_RESTART_ATTEMPTS = 10;
 
 export class MammotionClient extends EventEmitter {
   private process?: ChildProcessWithoutNullStreams;
@@ -30,6 +42,10 @@ export class MammotionClient extends EventEmitter {
   private buffer = '';
   private pythonPath: string;
   private readonly userConfiguredPythonPath: boolean;
+  private stopping = false;
+  private restartAttempts = 0;
+  private restartTimer?: NodeJS.Timeout;
+  private hasStartedSuccessfully = false;
 
   constructor(
     private readonly log: Logger,
@@ -71,33 +87,107 @@ export class MammotionClient extends EventEmitter {
     this.process.on('exit', (code, signal) => {
       const error = new Error(`Bridge exited (code=${code ?? 'null'}, signal=${signal ?? 'null'})`);
       for (const [, request] of this.pending) {
+        clearTimeout(request.timer);
         request.reject(error);
       }
       this.pending.clear();
       this.process = undefined;
       this.emit('exit', error);
+
+      // Only auto-respawn crashes that happen after a successful start.
+      // Failures during start() are owned by the platform's bounded startup
+      // retry, so this avoids two competing restart loops.
+      if (!this.stopping && this.hasStartedSuccessfully) {
+        this.scheduleRestart();
+      }
     });
 
+    // Mirror the 'exit' handler: a process-level 'error' (e.g. spawn failure
+    // or an EPIPE that surfaces as an error rather than an exit) must tear the
+    // bridge down identically and, like 'exit', schedule a bounded restart for
+    // crashes that happen after a successful start.
     this.process.on('error', (err) => {
       const error = new Error(`Bridge process error: ${err.message}`);
       for (const [, request] of this.pending) {
+        clearTimeout(request.timer);
         request.reject(error);
       }
       this.pending.clear();
       this.process = undefined;
       this.emit('exit', error);
+
+      if (!this.stopping && this.hasStartedSuccessfully) {
+        this.scheduleRestart();
+      }
     });
 
     this.process.stdin.on('error', (err) => this.log.debug(`Bridge stdin error: ${err.message}`));
 
-    await this.request('init', {
-      email: this.config.email,
-      password: this.config.password,
-      areaNameFallbacks: this.config.areaNameFallbacks ?? {},
-    });
+    try {
+      await this.request('init', {
+        email: this.config.email,
+        password: this.config.password,
+        areaNameFallbacks: this.config.areaNameFallbacks ?? {},
+      });
+    } catch (error) {
+      // The bridge can stay alive after a failed init (e.g. it returns
+      // {ok:false} for an auth error without exiting). Tear it down so the
+      // process is not orphaned and the next start() spawns a fresh bridge
+      // instead of short-circuiting on the `if (this.process)` guard above.
+      const proc = this.process;
+      this.process = undefined;
+      proc?.kill();
+      throw error;
+    }
+
+    this.hasStartedSuccessfully = true;
+    this.restartAttempts = 0;
+  }
+
+  private timeoutForMethod(method: string): number {
+    const base = REQUEST_TIMEOUTS_MS[method] ?? DEFAULT_REQUEST_TIMEOUT_MS;
+
+    if (method === 'shutdown') {
+      return base;
+    }
+
+    const override = this.config.requestTimeoutSeconds;
+    if (typeof override === 'number' && Number.isFinite(override) && override > 0) {
+      return override * 1000;
+    }
+
+    return base;
+  }
+
+  private scheduleRestart(): void {
+    if (this.restartAttempts >= MAX_RESTART_ATTEMPTS) {
+      this.log.error(
+        `Mammotion bridge failed to stay running after ${MAX_RESTART_ATTEMPTS} restart attempts; giving up. Restart Homebridge to try again.`,
+      );
+      return;
+    }
+
+    const delay = Math.min(60000, 2000 * 2 ** this.restartAttempts);
+    this.restartAttempts++;
+    this.log.warn(
+      `Mammotion bridge will restart in ${delay / 1000}s (attempt ${this.restartAttempts}/${MAX_RESTART_ATTEMPTS}).`,
+    );
+
+    this.restartTimer = setTimeout(() => {
+      this.start().catch((error: Error) => {
+        this.log.error(`Mammotion bridge restart failed: ${error.message}`);
+      });
+    }, delay);
+    this.restartTimer.unref?.();
   }
 
   async stop(): Promise<void> {
+    this.stopping = true;
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = undefined;
+    }
+
     if (!this.process) {
       return;
     }
@@ -130,10 +220,20 @@ export class MammotionClient extends EventEmitter {
     const id = this.nextId++;
     const payload = JSON.stringify({ id, method, params });
 
+    const timeoutMs = this.timeoutForMethod(method);
+
     const responsePromise = new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pending.delete(id)) {
+          reject(new Error(`Bridge request '${method}' timed out after ${timeoutMs / 1000}s`));
+        }
+      }, timeoutMs);
+      timer.unref?.();
+
       this.pending.set(id, {
         resolve: (value: unknown) => resolve(value as T),
         reject,
+        timer,
       });
     });
 
@@ -175,6 +275,7 @@ export class MammotionClient extends EventEmitter {
       }
 
       this.pending.delete(message.id);
+      clearTimeout(request.timer);
 
       if (!message.ok) {
         request.reject(new Error(message.error ?? 'Unknown bridge error'));

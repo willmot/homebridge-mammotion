@@ -33,6 +33,7 @@ export class MammotionPlatform implements DynamicPlatformPlugin {
   private pollTimer?: NodeJS.Timeout;
   private polling = false;
   private started = false;
+  private startupAttempts = 0;
   private readonly client: MammotionClient;
   private readonly usingMatterRvc: boolean;
   private readonly uuidNamespace: string;
@@ -99,7 +100,24 @@ export class MammotionPlatform implements DynamicPlatformPlugin {
 
       this.log.info(`Mammotion polling every ${this.pollingSeconds}s`);
     } catch (error) {
+      this.started = false;
+      this.startupAttempts++;
+      const maxAttempts = 5;
       this.log.error(`Mammotion startup failed: ${(error as Error).message}`);
+
+      if (this.startupAttempts <= maxAttempts) {
+        const delay = Math.min(60000, 5000 * 2 ** (this.startupAttempts - 1));
+        this.log.warn(
+          `Mammotion startup will retry in ${delay / 1000}s (attempt ${this.startupAttempts}/${maxAttempts}).`,
+        );
+        setTimeout(() => {
+          void this.startup();
+        }, delay).unref?.();
+      } else {
+        this.log.error(
+          `Mammotion startup failed ${maxAttempts} times; giving up. Fix the configuration (e.g. credentials) and restart Homebridge.`,
+        );
+      }
     }
   }
 

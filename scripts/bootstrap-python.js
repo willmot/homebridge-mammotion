@@ -5,8 +5,12 @@ const { join } = require('node:path');
 const { spawnSync } = require('node:child_process');
 
 const REQUIRED_MAJOR = 3;
-const REQUIRED_MINOR = 10;
+// PYMAMMOTION_SPEC requires Python >= 3.12, so the managed runtime must be 3.12+.
+const REQUIRED_MINOR = 12;
 const PYMAMMOTION_SPEC = 'pymammotion==0.5.75';
+// pymammotion 0.5.75's bundled protos are compiled with betterproto2_compiler 0.9.x;
+// the runtime betterproto2 must match (0.10.x makes `import pymammotion` fail), so pin it.
+const BETTERPROTO2_SPEC = 'betterproto2>=0.9,<0.10';
 const root = join(__dirname, '..');
 const venvDir = join(root, '.python-bridge-venv');
 const venvPython = process.platform === 'win32'
@@ -87,7 +91,7 @@ for (const candidate of candidates) {
 }
 
 if (!selected) {
-  console.warn('[homebridge-mammotion] No Python 3.10+ interpreter found during install. Runtime bootstrap will retry on first start.');
+  console.warn('[homebridge-mammotion] No Python 3.12+ interpreter found during install. Runtime bootstrap will retry on first start.');
   process.exit(0);
 }
 
@@ -103,7 +107,7 @@ if (!runOrWarn(venvPython, ['-m', 'pip', 'install', '--upgrade', 'pip'], 'pip up
   process.exit(0);
 }
 
-if (!runOrWarn(venvPython, ['-m', 'pip', 'install', '--upgrade', PYMAMMOTION_SPEC], `pip install ${PYMAMMOTION_SPEC}`)) {
+if (!runOrWarn(venvPython, ['-m', 'pip', 'install', '--upgrade', PYMAMMOTION_SPEC, BETTERPROTO2_SPEC], `pip install ${PYMAMMOTION_SPEC} ${BETTERPROTO2_SPEC}`)) {
   process.exit(0);
 }
 

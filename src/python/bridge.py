@@ -405,8 +405,11 @@ async def main() -> None:
         if not line:
             continue
 
+        request_id = None
         try:
             payload = json.loads(line)
+            if not isinstance(payload, dict):
+                raise ValueError("payload must be an object")
             request_id = payload.get("id")
             method = payload.get("method")
             params = payload.get("params") or {}
@@ -417,7 +420,7 @@ async def main() -> None:
             response = {"id": request_id, "ok": True, "data": data}
         except Exception as exc:
             response = {
-                "id": payload.get("id") if isinstance(payload, dict) else None,
+                "id": request_id,
                 "ok": False,
                 "error": str(exc),
             }

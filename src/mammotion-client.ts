@@ -78,6 +78,18 @@ export class MammotionClient extends EventEmitter {
       this.emit('exit', error);
     });
 
+    this.process.on('error', (err) => {
+      const error = new Error(`Bridge process error: ${err.message}`);
+      for (const [, request] of this.pending) {
+        request.reject(error);
+      }
+      this.pending.clear();
+      this.process = undefined;
+      this.emit('exit', error);
+    });
+
+    this.process.stdin.on('error', (err) => this.log.debug(`Bridge stdin error: ${err.message}`));
+
     await this.request('init', {
       email: this.config.email,
       password: this.config.password,

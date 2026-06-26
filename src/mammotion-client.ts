@@ -45,6 +45,7 @@ export class MammotionClient extends EventEmitter {
   private stopping = false;
   private restartAttempts = 0;
   private restartTimer?: NodeJS.Timeout;
+  private hasStartedSuccessfully = false;
 
   constructor(
     private readonly log: Logger,
@@ -93,17 +94,32 @@ export class MammotionClient extends EventEmitter {
       this.process = undefined;
       this.emit('exit', error);
 
-      if (!this.stopping) {
+      // Only auto-respawn crashes that happen after a successful start.
+      // Failures during start() are owned by the platform's bounded startup
+      // retry, so this avoids two competing restart loops.
+      if (!this.stopping && this.hasStartedSuccessfully) {
         this.scheduleRestart();
       }
     });
 
-    await this.request('init', {
-      email: this.config.email,
-      password: this.config.password,
-      areaNameFallbacks: this.config.areaNameFallbacks ?? {},
-    });
+    try {
+      await this.request('init', {
+        email: this.config.email,
+        password: this.config.password,
+        areaNameFallbacks: this.config.areaNameFallbacks ?? {},
+      });
+    } catch (error) {
+      // The bridge can stay alive after a failed init (e.g. it returns
+      // {ok:false} for an auth error without exiting). Tear it down so the
+      // process is not orphaned and the next start() spawns a fresh bridge
+      // instead of short-circuiting on the `if (this.process)` guard above.
+      const proc = this.process;
+      this.process = undefined;
+      proc?.kill();
+      throw error;
+    }
 
+    this.hasStartedSuccessfully = true;
     this.restartAttempts = 0;
   }
 

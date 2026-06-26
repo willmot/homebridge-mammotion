@@ -187,15 +187,27 @@ export class MammotionPlatform implements DynamicPlatformPlugin {
 
     if (toRegister.length > 0) {
       await matter.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, toRegister);
+      for (const accessory of toRegister) {
+        const uuid = (accessory as { UUID?: string }).UUID;
+        if (typeof uuid === 'string') {
+          this.cachedMatterAccessories.set(uuid, accessory);
+        }
+      }
       this.log.info(`Registered ${toRegister.length} Matter robotic vacuum accessory(s)`);
     }
 
     const stale = Array.from(this.cachedMatterAccessories.entries())
-      .filter(([uuid]) => !liveUuids.has(uuid))
-      .map(([, accessory]) => accessory);
+      .filter(([uuid]) => !liveUuids.has(uuid));
 
     if (stale.length > 0) {
-      await matter.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, stale);
+      await matter.unregisterPlatformAccessories(
+        PLUGIN_NAME,
+        PLATFORM_NAME,
+        stale.map(([, accessory]) => accessory),
+      );
+      for (const [uuid] of stale) {
+        this.cachedMatterAccessories.delete(uuid);
+      }
       this.log.info(`Removed ${stale.length} stale Matter accessory(s)`);
     }
   }

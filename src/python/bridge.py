@@ -1,5 +1,36 @@
 #!/usr/bin/env python3
-"""Persistent JSONL bridge between Homebridge and PyMammotion."""
+"""Persistent JSONL bridge between Homebridge and PyMammotion.
+
+Adapted for pymammotion 0.8.x (verified against 0.8.8).
+
+The external JSON-RPC-over-stdio contract is UNCHANGED from the 0.5.75 bridge so
+the (unmodified) Node side keeps working:
+
+  * stdin  : one JSON object per line, ``{"id", "method", "params"}``
+  * stdout : one JSON object per line, ``{"id", "ok": true, "data": ...}`` on
+             success or ``{"id", "ok": false, "error": "..."}`` on failure.
+
+  methods  : init | list_devices | poll | command | shutdown
+  init      params : {email, password, areaNameFallbacks}
+  command   params : {name, action}  with action in {start, pause, dock, cancel}
+
+  list_devices -> [{name, iotId, model, serialNumber}]
+  poll/command -> [{name, online, battery, chargeState, sysStatus, modeName,
+                    areaProgress, hasError, serviceAreas, selectedAreaIds,
+                    currentAreaId}]
+
+What changed internally for 0.8.x (see the notes shipped with this file):
+  * Entry point is now ``pymammotion.client.MammotionClient`` (the old
+    ``pymammotion.mammotion.devices.mammotion.Mammotion`` no longer exists).
+  * Devices are enumerated through ``client.device_registry.all_devices``,
+    which yields ``DeviceHandle`` objects (``.device_name``, ``.iot_id``,
+    ``.snapshot``).  The underlying ``MowerDevice`` (== the old ``MowingDevice``)
+    is ``handle.snapshot.raw``.
+  * ``start_schedule_sync`` was renamed to ``start_plan_sync``.
+  * The App-Version / pymammotion issue #137 workaround is applied by
+    constructing ``MammotionClient(ha_version="3.4.22")`` so the HTTP
+    ``App-Version`` header becomes ``HA,2.3.4.22``.
+"""
 
 from __future__ import annotations
 
@@ -8,14 +39,29 @@ import json
 import sys
 from typing import Any
 
-from pymammotion.mammotion.devices.mammotion import Mammotion
+from pymammotion.client import MammotionClient
+from pymammotion.const import APP_VERSION
 from pymammotion.proto import RptAct, RptInfoType
 from pymammotion.utility.constant.device_constant import WorkMode, device_mode
+
+# pymammotion issue #137 App-Version gate.
+#
+# MammotionHTTP builds its header as f"HA,2.{ha_version}" (http.py:168). The
+# Mammotion backend rejects stale app versions (e.g. HA,2.3.4.22) and the
+# "NOT HA,"/"ALIYUN DEMO," prefixes with {"code":200,"msg":"Access denied"},
+# but accepts the "HA,2." prefix with a *current* app version. pymammotion's
+# bundled APP_VERSION (e.g. "2.3.8.19") tracks the current app, so derive
+# ha_version from it (strip the leading "2.") -> header "HA,2.3.8.19", and it
+# auto-follows future pymammotion APP_VERSION bumps. If Access-denied recurs,
+# set the APP_VERSION env var or hardcode a newer value here.
+HA_VERSION = APP_VERSION.split(".", 1)[1] if APP_VERSION.startswith("2.") else "3.8.19"
 
 
 class Bridge:
     def __init__(self) -> None:
-        self.mammotion = Mammotion()
+        # ha_version is forwarded to MammotionHTTP via login_and_initiate_cloud,
+        # producing the App-Version: HA,2.3.4.22 header (issue #137 fix).
+        self.mammotion = MammotionClient(ha_version=HA_VERSION)
         self.email: str | None = None
         self.password: str | None = None
         self.area_name_fallbacks: dict[str, list[str]] = {}
@@ -60,16 +106,47 @@ class Bridge:
         await self.mammotion.login_and_initiate_cloud(email, password)
         return {"ready": True}
 
+    # ------------------------------------------------------------------
+    # Device access helpers (0.8.x device-registry / DeviceHandle based)
+    # ------------------------------------------------------------------
+
+    def _handles(self) -> list[Any]:
+        """Return all registered DeviceHandle objects."""
+        return list(self.mammotion.device_registry.all_devices)
+
+    def _handle_by_name(self, name: str) -> Any:
+        """Return the DeviceHandle for *name* or raise (mirrors old get_device_by_name semantics)."""
+        handle = self.mammotion.device_registry.get_by_name(name)
+        if handle is None:
+            raise ValueError(f"Device '{name}' not registered")
+        return handle
+
+    @staticmethod
+    def _raw_state(handle: Any) -> Any:
+        """Return the underlying MowerDevice (== old MowingDevice) for a handle."""
+        return handle.snapshot.raw
+
+    @staticmethod
+    def _is_online(handle: Any) -> bool:
+        """Best-effort online flag from the immutable snapshot."""
+        try:
+            return bool(handle.snapshot.online)
+        except Exception:
+            # Fall back to the raw device's static online flag if the snapshot
+            # API ever changes shape.
+            return bool(getattr(handle.snapshot.raw, "online", False))
+
     async def _list_devices(self) -> list[dict[str, Any]]:
         devices = []
-        for manager in self.mammotion.device_manager.devices.values():
-            name = manager.name
+        for handle in self._handles():
+            name = handle.device_name
             serial = name.split("-", 1)[-1] if "-" in name else name
-            model = manager.state.mower_state.model or manager.state.mower_state.product_key
+            state = self._raw_state(handle)
+            model = state.mower_state.model or state.mower_state.product_key
             devices.append(
                 {
                     "name": name,
-                    "iotId": manager.iot_id,
+                    "iotId": handle.iot_id,
                     "model": model,
                     "serialNumber": serial,
                 }
@@ -81,17 +158,18 @@ class Bridge:
     async def _poll(self) -> list[dict[str, Any]]:
         states = []
         now = asyncio.get_running_loop().time()
-        for manager in self.mammotion.device_manager.devices.values():
-            device_name = manager.name
+        for handle in self._handles():
+            device_name = handle.device_name
+            state = self._raw_state(handle)
             # Best effort state refresh from the mower before we read cached state.
             try:
                 await self._request_iot_sync(device_name)
             except Exception:
                 pass
 
-            map_area_names = list(getattr(manager.state.map, "area_name", []) or [])
-            map_areas = dict(getattr(manager.state.map, "area", {}) or {})
-            map_plans = dict(getattr(manager.state.map, "plan", {}) or {})
+            map_area_names = list(getattr(state.map, "area_name", []) or [])
+            map_areas = dict(getattr(state.map, "area", {}) or {})
+            map_plans = dict(getattr(state.map, "plan", {}) or {})
 
             if now >= self._next_area_refresh_at.get(device_name, 0):
                 try:
@@ -104,7 +182,7 @@ class Bridge:
                 except Exception as ex:
                     self._debug(f"{device_name}: get_all_boundary_hash_list failed: {ex}")
                 try:
-                    await self._send_command(device_name, "get_area_name_list", device_id=manager.iot_id)
+                    await self._send_command(device_name, "get_area_name_list", device_id=handle.iot_id)
                 except Exception as ex:
                     self._debug(f"{device_name}: get_area_name_list failed: {ex}")
 
@@ -116,9 +194,10 @@ class Bridge:
 
             if now >= self._next_plan_refresh_at.get(device_name, 0):
                 try:
-                    await self.mammotion.start_schedule_sync(device_name)
+                    # 0.8.x: start_schedule_sync was renamed to start_plan_sync.
+                    await self.mammotion.start_plan_sync(device_name)
                 except Exception as ex:
-                    self._debug(f"{device_name}: start_schedule_sync failed: {ex}")
+                    self._debug(f"{device_name}: start_plan_sync failed: {ex}")
 
                 if len(map_plans) == 0:
                     self._next_plan_refresh_at[device_name] = now + 20.0
@@ -135,11 +214,11 @@ class Bridge:
             fallback_names = self._configured_area_names(device_name)
             self._debug(
                 f"{device_name}: map areas={len(map_areas)} area_names={len(map_area_names)} "
-                f"zone_hashs={len(list(getattr(getattr(manager.state, 'work', None), 'zone_hashs', []) or []))} "
+                f"zone_hashs={len(list(getattr(getattr(state, 'work', None), 'zone_hashs', []) or []))} "
                 f"plans={len(map_plans)} plan_names={plan_names} fallback_names={fallback_names}"
             )
 
-            states.append(self._to_state(device_name, manager.state))
+            states.append(self._to_state(device_name, handle))
 
         states.sort(key=lambda item: item["name"])
         return states
@@ -150,9 +229,10 @@ class Bridge:
         if not name or not action:
             raise ValueError("Missing name or action")
 
-        manager = self.mammotion.get_device_by_name(name)
-        mode = manager.state.report_data.dev.sys_status
-        charge_state = manager.state.report_data.dev.charge_state
+        handle = self._handle_by_name(name)
+        state = self._raw_state(handle)
+        mode = state.report_data.dev.sys_status
+        charge_state = state.report_data.dev.charge_state
 
         if action == "start":
             await self._start(name, mode)
@@ -168,7 +248,7 @@ class Bridge:
         await self._request_iot_sync(name)
         # Give device/state handlers a brief moment to apply updates.
         await asyncio.sleep(0.15)
-        return self._to_state(name, self.mammotion.get_device_by_name(name).state)
+        return self._to_state(name, self._handle_by_name(name))
 
     async def _send_command(self, name: str, command: str, **kwargs: Any) -> None:
         await self.mammotion.send_command_with_args(name, command, **kwargs)
@@ -239,7 +319,8 @@ class Bridge:
             count=0,
         )
 
-    def _to_state(self, device_name: str, state: Any) -> dict[str, Any]:
+    def _to_state(self, device_name: str, handle: Any) -> dict[str, Any]:
+        state = self._raw_state(handle)
         dev = state.report_data.dev
         work = state.report_data.work
         battery = int(getattr(dev, "battery_val", 0) or 0)
@@ -252,7 +333,7 @@ class Bridge:
 
         return {
             "name": state.name,
-            "online": bool(state.online),
+            "online": self._is_online(handle),
             "battery": battery,
             "chargeState": charge_state,
             "sysStatus": sys_status,
@@ -405,11 +486,12 @@ async def main() -> None:
         if not line:
             continue
 
+        # Initialise request_id BEFORE the try so a malformed/partial payload
+        # (json.loads raising before request_id is assigned) still produces a
+        # well-formed error response the Node side can correlate (or drop).
         request_id = None
         try:
             payload = json.loads(line)
-            if not isinstance(payload, dict):
-                raise ValueError("payload must be an object")
             request_id = payload.get("id")
             method = payload.get("method")
             params = payload.get("params") or {}

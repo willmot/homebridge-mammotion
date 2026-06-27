@@ -5,11 +5,12 @@ import { join } from 'node:path';
 import type { Logger } from 'homebridge';
 
 const REQUIRED_MAJOR = 3;
-// PYMAMMOTION_SPEC requires Python >= 3.12, so the managed runtime must be 3.12+.
-const REQUIRED_MINOR = 12;
-const PYMAMMOTION_SPEC = 'pymammotion==0.5.75';
+// pymammotion 0.8.x requires Python >= 3.13, so the managed runtime must be 3.13+.
+const REQUIRED_MINOR = 13;
+const PYMAMMOTION_SPEC = 'pymammotion==0.8.8';
 // pymammotion 0.5.75's bundled protos are compiled with betterproto2_compiler 0.9.x;
 // the runtime betterproto2 must match (0.10.x makes `import pymammotion` fail), so pin it.
+// (pymammotion 0.8.8 self-pins betterproto2==0.9.1 which satisfies this; harmless to keep.)
 const BETTERPROTO2_SPEC = 'betterproto2>=0.9,<0.10';
 
 export type PythonProbe = {
@@ -126,7 +127,7 @@ export async function bootstrapManagedPython(log: Logger): Promise<string> {
   if (!selectedPython) {
     throw new Error(
       [
-        'No compatible Python 3.12+ interpreter found to bootstrap managed PyMammotion runtime.',
+        'No compatible Python 3.13+ interpreter found to bootstrap managed PyMammotion runtime.',
         `Candidates checked: ${candidates.join(', ')}`,
         `Probe failures: ${failures.join(' | ')}`,
       ].join(' '),
@@ -142,8 +143,8 @@ export async function bootstrapManagedPython(log: Logger): Promise<string> {
   log.info('Installing PyMammotion into managed environment (first run may take a minute).');
   await ensureSuccess(await runCommand(managedPython, ['-m', 'pip', 'install', '--upgrade', 'pip']), 'pip upgrade');
   await ensureSuccess(
-    await runCommand(managedPython, ['-m', 'pip', 'install', '--upgrade', PYMAMMOTION_SPEC, BETTERPROTO2_SPEC]),
-    `pip install ${PYMAMMOTION_SPEC} ${BETTERPROTO2_SPEC}`,
+    await runCommand(managedPython, ['-m', 'pip', 'install', '--upgrade', PYMAMMOTION_SPEC, BETTERPROTO2_SPEC, 'packaging']),
+    `pip install ${PYMAMMOTION_SPEC} ${BETTERPROTO2_SPEC} packaging`,
   );
 
   const finalProbe = await probePython(managedPython);

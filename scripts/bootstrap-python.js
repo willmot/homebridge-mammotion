@@ -6,7 +6,8 @@ const { spawnSync } = require('node:child_process');
 
 const REQUIRED_MAJOR = 3;
 const REQUIRED_MINOR = 10;
-const PYMAMMOTION_SPEC = 'pymammotion==0.5.75';
+const PYMAMMOTION_VERSION = '0.8.11';
+const PYMAMMOTION_SPEC = `pymammotion==${PYMAMMOTION_VERSION}`;
 const root = join(__dirname, '..');
 const venvDir = join(root, '.python-bridge-venv');
 const venvPython = process.platform === 'win32'
@@ -19,7 +20,7 @@ if (process.env.HOMEBRIDGE_MAMMOTION_SKIP_PY_BOOTSTRAP === '1') {
 }
 
 function probePython(pythonPath) {
-  const script = 'import importlib.util, json, sys; print(json.dumps({"version": [sys.version_info[0], sys.version_info[1], sys.version_info[2]], "has_pymammotion": bool(importlib.util.find_spec("pymammotion"))}))';
+  const script = 'import importlib.metadata, importlib.util, json, sys; found = bool(importlib.util.find_spec("pymammotion")); print(json.dumps({"version": [sys.version_info[0], sys.version_info[1], sys.version_info[2]], "has_pymammotion": found, "pymammotion_version": importlib.metadata.version("pymammotion") if found else None}))';
 
   const result = spawnSync(pythonPath, ['-c', script], { encoding: 'utf8' });
   if (result.status !== 0 || !result.stdout) {
@@ -33,6 +34,7 @@ function probePython(pythonPath) {
       minor: parsed.version[1],
       patch: parsed.version[2],
       hasPyMammotion: !!parsed.has_pymammotion,
+      pyMammotionVersion: parsed.pymammotion_version,
     };
   } catch {
     return null;
@@ -55,7 +57,7 @@ function runOrWarn(command, args, step) {
 }
 
 const existing = probePython(venvPython);
-if (supported(existing) && existing.hasPyMammotion) {
+if (supported(existing) && existing.hasPyMammotion && existing.pyMammotionVersion === PYMAMMOTION_VERSION) {
   console.log('[homebridge-mammotion] Managed Python environment already ready.');
   process.exit(0);
 }
@@ -103,7 +105,7 @@ if (!runOrWarn(venvPython, ['-m', 'pip', 'install', '--upgrade', 'pip'], 'pip up
   process.exit(0);
 }
 
-if (!runOrWarn(venvPython, ['-m', 'pip', 'install', '--upgrade', PYMAMMOTION_SPEC], `pip install ${PYMAMMOTION_SPEC}`)) {
+if (!runOrWarn(venvPython, ['-m', 'pip', 'install', '--upgrade', 'packaging', PYMAMMOTION_SPEC], `pip install packaging ${PYMAMMOTION_SPEC}`)) {
   process.exit(0);
 }
 

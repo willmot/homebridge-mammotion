@@ -6,12 +6,14 @@ import type { Logger } from 'homebridge';
 
 const REQUIRED_MAJOR = 3;
 const REQUIRED_MINOR = 10;
-const PYMAMMOTION_SPEC = 'pymammotion==0.5.75';
+const PYMAMMOTION_VERSION = '0.8.11';
+const PYMAMMOTION_SPEC = `pymammotion==${PYMAMMOTION_VERSION}`;
 
 export type PythonProbe = {
   available: boolean;
   executable?: string;
   hasPyMammotion: boolean;
+  pyMammotionVersion?: string;
   major?: number;
   minor?: number;
   patch?: number;
@@ -43,7 +45,7 @@ export function versionLabel(probe: PythonProbe): string {
 }
 
 export async function probePython(pythonPath: string): Promise<PythonProbe> {
-  const script = 'import importlib.util, json, sys; print(json.dumps({"executable": sys.executable, "version": [sys.version_info[0], sys.version_info[1], sys.version_info[2]], "has_pymammotion": bool(importlib.util.find_spec("pymammotion"))}))';
+  const script = 'import importlib.metadata, importlib.util, json, sys; found = bool(importlib.util.find_spec("pymammotion")); print(json.dumps({"executable": sys.executable, "version": [sys.version_info[0], sys.version_info[1], sys.version_info[2]], "has_pymammotion": found, "pymammotion_version": importlib.metadata.version("pymammotion") if found else None}))';
 
   const result = await runCommand(pythonPath, ['-c', script]);
   if (result.code !== 0) {
@@ -59,6 +61,7 @@ export async function probePython(pythonPath: string): Promise<PythonProbe> {
       executable: string;
       version: [number, number, number];
       has_pymammotion: boolean;
+      pymammotion_version?: string;
     };
 
     return {
@@ -68,6 +71,7 @@ export async function probePython(pythonPath: string): Promise<PythonProbe> {
       minor: parsed.version[1],
       patch: parsed.version[2],
       hasPyMammotion: parsed.has_pymammotion,
+      pyMammotionVersion: parsed.pymammotion_version,
     };
   } catch {
     return { available: false, hasPyMammotion: false, error: 'failed to parse python probe output' };
@@ -77,7 +81,8 @@ export async function probePython(pythonPath: string): Promise<PythonProbe> {
 export async function bootstrapManagedPython(log: Logger): Promise<string> {
   const managedPython = managedVenvPythonPath();
   const existingProbe = await probePython(managedPython);
-  if (existingProbe.available && versionIsSupported(existingProbe) && existingProbe.hasPyMammotion) {
+  if (existingProbe.available && versionIsSupported(existingProbe)
+    && existingProbe.hasPyMammotion && existingProbe.pyMammotionVersion === PYMAMMOTION_VERSION) {
     return managedPython;
   }
 
@@ -138,12 +143,13 @@ export async function bootstrapManagedPython(log: Logger): Promise<string> {
   log.info('Installing PyMammotion into managed environment (first run may take a minute).');
   await ensureSuccess(await runCommand(managedPython, ['-m', 'pip', 'install', '--upgrade', 'pip']), 'pip upgrade');
   await ensureSuccess(
-    await runCommand(managedPython, ['-m', 'pip', 'install', '--upgrade', PYMAMMOTION_SPEC]),
-    `pip install ${PYMAMMOTION_SPEC}`,
+    await runCommand(managedPython, ['-m', 'pip', 'install', '--upgrade', 'packaging', PYMAMMOTION_SPEC]),
+    `pip install packaging ${PYMAMMOTION_SPEC}`,
   );
 
   const finalProbe = await probePython(managedPython);
-  if (!finalProbe.available || !finalProbe.hasPyMammotion) {
+  if (!finalProbe.available || !finalProbe.hasPyMammotion
+    || finalProbe.pyMammotionVersion !== PYMAMMOTION_VERSION) {
     throw new Error('Managed Python bootstrap completed but pymammotion import still failed.');
   }
 

@@ -186,6 +186,12 @@ export class MammotionClient extends EventEmitter {
         );
         this.pythonPath = await bootstrapManagedPython(this.log);
         probe = await probePython(this.pythonPath);
+      } else if (!probe.hasPyMammotion) {
+        this.log.warn(
+          `Configured pythonPath "${probe.executable ?? this.pythonPath}" does not have module "pymammotion". Falling back to managed runtime.`,
+        );
+        this.pythonPath = await bootstrapManagedPython(this.log);
+        probe = await probePython(this.pythonPath);
       }
     }
 
@@ -202,17 +208,6 @@ export class MammotionClient extends EventEmitter {
     }
 
     if (!probe.hasPyMammotion) {
-      if (this.userConfiguredPythonPath) {
-        const installHint = `${this.pythonPath} -m pip install --upgrade pip pymammotion==0.5.75`;
-        throw new Error(
-          [
-            `Python found at ${probe.executable ?? this.pythonPath} but module "pymammotion" is missing.`,
-            `Install it with: ${installHint}`,
-            'Or remove "pythonPath" to use managed runtime.',
-          ].join(' '),
-        );
-      }
-
       throw new Error('Managed runtime bootstrap completed but pymammotion is still unavailable.');
     }
   }

@@ -8,14 +8,26 @@ import json
 import sys
 from typing import Any
 
-from pymammotion.mammotion.devices.mammotion import Mammotion
-from pymammotion.proto import RptAct, RptInfoType
-from pymammotion.utility.constant.device_constant import WorkMode, device_mode
+from aiohttp import ClientResponse
+from pymammotion.client import MammotionClient
+from pymammotion.utility.constant import WorkMode, device_mode
+
+
+_aiohttp_client_response_json = ClientResponse.json
+
+
+async def _json_allow_missing_content_type(self: ClientResponse, *args: Any, **kwargs: Any) -> Any:
+    if "content_type" not in kwargs and not self.headers.get("Content-Type"):
+        kwargs["content_type"] = None
+    return await _aiohttp_client_response_json(self, *args, **kwargs)
+
+
+ClientResponse.json = _json_allow_missing_content_type
 
 
 class Bridge:
     def __init__(self) -> None:
-        self.mammotion = Mammotion()
+        self.mammotion = MammotionClient()
         self.email: str | None = None
         self.password: str | None = None
         self.area_name_fallbacks: dict[str, list[str]] = {}
@@ -62,14 +74,22 @@ class Bridge:
 
     async def _list_devices(self) -> list[dict[str, Any]]:
         devices = []
-        for manager in self.mammotion.device_manager.devices.values():
-            name = manager.name
+        for handle in self.mammotion.device_registry.all_devices:
+            state = handle.snapshot.raw
+            if not self._is_mower_state(state):
+                continue
+            name = handle.device_name
             serial = name.split("-", 1)[-1] if "-" in name else name
-            model = manager.state.mower_state.model or manager.state.mower_state.product_key
+            mower_state = getattr(state, "mower_state", None)
+            model = (
+                getattr(mower_state, "model", "")
+                or getattr(mower_state, "product_key", "")
+                or getattr(state, "product_key", "")
+            )
             devices.append(
                 {
                     "name": name,
-                    "iotId": manager.iot_id,
+                    "iotId": handle.iot_id,
                     "model": model,
                     "serialNumber": serial,
                 }
@@ -81,17 +101,21 @@ class Bridge:
     async def _poll(self) -> list[dict[str, Any]]:
         states = []
         now = asyncio.get_running_loop().time()
-        for manager in self.mammotion.device_manager.devices.values():
-            device_name = manager.name
+        for handle in self.mammotion.device_registry.all_devices:
+            device_name = handle.device_name
+            state = handle.snapshot.raw
+            if not self._is_mower_state(state):
+                continue
             # Best effort state refresh from the mower before we read cached state.
             try:
                 await self._request_iot_sync(device_name)
             except Exception:
                 pass
+            state = handle.snapshot.raw
 
-            map_area_names = list(getattr(manager.state.map, "area_name", []) or [])
-            map_areas = dict(getattr(manager.state.map, "area", {}) or {})
-            map_plans = dict(getattr(manager.state.map, "plan", {}) or {})
+            map_area_names = list(getattr(state.map, "area_name", []) or [])
+            map_areas = dict(getattr(state.map, "area", {}) or {})
+            map_plans = dict(getattr(state.map, "plan", {}) or {})
 
             if now >= self._next_area_refresh_at.get(device_name, 0):
                 try:
@@ -104,7 +128,7 @@ class Bridge:
                 except Exception as ex:
                     self._debug(f"{device_name}: get_all_boundary_hash_list failed: {ex}")
                 try:
-                    await self._send_command(device_name, "get_area_name_list", device_id=manager.iot_id)
+                    await self._send_command(device_name, "get_area_name_list", device_id=handle.iot_id)
                 except Exception as ex:
                     self._debug(f"{device_name}: get_area_name_list failed: {ex}")
 
@@ -116,15 +140,17 @@ class Bridge:
 
             if now >= self._next_plan_refresh_at.get(device_name, 0):
                 try:
-                    await self.mammotion.start_schedule_sync(device_name)
+                    await self.mammotion.start_plan_sync(device_name)
                 except Exception as ex:
-                    self._debug(f"{device_name}: start_schedule_sync failed: {ex}")
+                    self._debug(f"{device_name}: start_plan_sync failed: {ex}")
 
                 if len(map_plans) == 0:
                     self._next_plan_refresh_at[device_name] = now + 20.0
                 else:
                     self._next_plan_refresh_at[device_name] = now + 300.0
 
+            state = handle.snapshot.raw
+            map_plans = dict(getattr(state.map, "plan", {}) or {})
             plan_names = []
             for plan in map_plans.values():
                 task_name = str(getattr(plan, "task_name", "")).strip()
@@ -135,11 +161,11 @@ class Bridge:
             fallback_names = self._configured_area_names(device_name)
             self._debug(
                 f"{device_name}: map areas={len(map_areas)} area_names={len(map_area_names)} "
-                f"zone_hashs={len(list(getattr(getattr(manager.state, 'work', None), 'zone_hashs', []) or []))} "
+                f"zone_hashs={len(list(getattr(getattr(state, 'work', None), 'zone_hashs', []) or []))} "
                 f"plans={len(map_plans)} plan_names={plan_names} fallback_names={fallback_names}"
             )
 
-            states.append(self._to_state(device_name, manager.state))
+            states.append(self._to_state(device_name, state, online=handle.snapshot.online))
 
         states.sort(key=lambda item: item["name"])
         return states
@@ -150,9 +176,11 @@ class Bridge:
         if not name or not action:
             raise ValueError("Missing name or action")
 
-        manager = self.mammotion.get_device_by_name(name)
-        mode = manager.state.report_data.dev.sys_status
-        charge_state = manager.state.report_data.dev.charge_state
+        state = self.mammotion.get_device_by_name(name)
+        if state is None:
+            raise ValueError(f"Unknown device: {name}")
+        mode = state.report_data.dev.sys_status
+        charge_state = state.report_data.dev.charge_state
 
         if action == "start":
             await self._start(name, mode)
@@ -168,7 +196,11 @@ class Bridge:
         await self._request_iot_sync(name)
         # Give device/state handlers a brief moment to apply updates.
         await asyncio.sleep(0.15)
-        return self._to_state(name, self.mammotion.get_device_by_name(name).state)
+        state = self.mammotion.get_device_by_name(name)
+        if state is None:
+            raise ValueError(f"Unknown device: {name}")
+        handle = self.mammotion.mower(name)
+        return self._to_state(name, state, online=handle.snapshot.online if handle is not None else None)
 
     async def _send_command(self, name: str, command: str, **kwargs: Any) -> None:
         await self.mammotion.send_command_with_args(name, command, **kwargs)
@@ -221,25 +253,9 @@ class Bridge:
             await self._send_command(name, "cancel_job")
 
     async def _request_iot_sync(self, name: str) -> None:
-        await self._send_command(
-            name,
-            "request_iot_sys",
-            rpt_act=RptAct.RPT_START,
-            rpt_info_type=[
-                RptInfoType.RIT_DEV_STA,
-                RptInfoType.RIT_DEV_LOCAL,
-                RptInfoType.RIT_WORK,
-                RptInfoType.RIT_MAINTAIN,
-                RptInfoType.RIT_BASESTATION_INFO,
-                RptInfoType.RIT_VIO,
-            ],
-            timeout=10000,
-            period=3000,
-            no_change_period=4000,
-            count=0,
-        )
+        await self.mammotion.request_iot_sync(name)
 
-    def _to_state(self, device_name: str, state: Any) -> dict[str, Any]:
+    def _to_state(self, device_name: str, state: Any, online: bool | None = None) -> dict[str, Any]:
         dev = state.report_data.dev
         work = state.report_data.work
         battery = int(getattr(dev, "battery_val", 0) or 0)
@@ -252,7 +268,7 @@ class Bridge:
 
         return {
             "name": state.name,
-            "online": bool(state.online),
+            "online": bool(state.online if online is None else online),
             "battery": battery,
             "chargeState": charge_state,
             "sysStatus": sys_status,
@@ -369,6 +385,10 @@ class Bridge:
             current_area = None
 
         return (service_areas, selected_areas, current_area)
+
+    @staticmethod
+    def _is_mower_state(state: Any) -> bool:
+        return hasattr(state, "report_data") and hasattr(state, "map") and hasattr(state, "mower_state")
 
     @staticmethod
     def _mode_name(value: int) -> str:

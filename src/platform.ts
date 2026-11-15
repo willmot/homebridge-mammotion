@@ -62,8 +62,8 @@ export class MammotionPlatform implements DynamicPlatformPlugin {
     });
   }
 
-  configureAccessory(accessory: PlatformAccessory<AccessoryContext>): void {
-    this.accessories.push(accessory);
+  configureAccessory(accessory: PlatformAccessory): void {
+    this.accessories.push(accessory as PlatformAccessory<AccessoryContext>);
   }
 
   configureMatterAccessory(accessory: unknown): void {

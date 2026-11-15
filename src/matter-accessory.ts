@@ -77,12 +77,8 @@ export class MammotionMatterVacuum {
           ],
           currentMode: 0,
         },
-        rvcCleanMode: {
-          supportedModes: [
-            { label: 'Vacuum', mode: 0, modeTags: [{ value: 16385 }] },
-          ],
-          currentMode: 0,
-        },
+        // RVC Clean Mode is optional and requires at least two modes. The mower
+        // exposes no selectable cleaning modes, so only advertise its run modes.
         rvcOperationalState: {
           operationalStateList: [
             { operationalStateId: 0 },

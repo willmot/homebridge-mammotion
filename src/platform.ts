@@ -6,8 +6,9 @@ import type {
 } from 'homebridge';
 
 import { MammotionAccessory } from './accessory';
-import { MammotionClient } from './mammotion-client';
+import { MammotionApiError, MammotionClient } from './mammotion-client';
 import { MammotionMatterVacuum } from './matter-accessory';
+import { MammotionStateError } from './state-mapper';
 import { PLATFORM_NAME, PLUGIN_NAME } from './settings';
 import type { MammotionDeviceInfo, MammotionPlatformConfig } from './types';
 
@@ -31,7 +32,11 @@ export class MammotionPlatform implements DynamicPlatformPlugin {
   private readonly cachedMatterAccessories = new Map<string, unknown>();
   private readonly pollingSeconds: number;
   private pollTimer?: NodeJS.Timeout;
-  private started = false;
+  private starting = false;
+  private shuttingDown = false;
+  private accessoriesReady = false;
+  private restartTimer?: NodeJS.Timeout;
+  private restartDelayMs = 10_000;
   private readonly client: MammotionClient;
   private readonly usingMatterRvc: boolean;
   private readonly uuidNamespace: string;
@@ -48,8 +53,8 @@ export class MammotionPlatform implements DynamicPlatformPlugin {
     this.usingMatterRvc = this.shouldUseMatterRvc();
     this.uuidNamespace = this.buildUuidNamespace();
 
-    if (!this.config.email || !this.config.password) {
-      this.log.error('Mammotion: set both email and password in config.');
+    if (!this.config.apiCredentialsPath) {
+      this.log.error('Mammotion: set apiCredentialsPath in config.');
       return;
     }
 
@@ -74,46 +79,115 @@ export class MammotionPlatform implements DynamicPlatformPlugin {
   }
 
   private async startup(): Promise<void> {
-    if (this.started) {
+    if (this.starting || this.shuttingDown) {
       return;
     }
-
-    this.started = true;
+    this.starting = true;
 
     try {
       await this.client.start();
-      if (this.usingMatterRvc) {
-        await this.discoverAndSyncMatterAccessories();
-      } else {
-        await this.discoverAndSyncAccessories();
+      if (this.shuttingDown) {
+        return;
       }
-      await this.pollOnce();
-
-      this.pollTimer = setInterval(() => {
-        void this.pollOnce().catch((error: Error) => {
-          this.log.warn(`Polling failed: ${error.message}`);
-        });
-      }, this.pollingSeconds * 1000);
-
+      // A transport reconnect must not remove/recreate paired accessories
+      // because a fresh cloud session has an incomplete device list.
+      if (!this.accessoriesReady) {
+        if (this.usingMatterRvc) {
+          await this.discoverAndSyncMatterAccessories();
+        } else {
+          await this.discoverAndSyncAccessories();
+        }
+        this.accessoriesReady = true;
+      }
+      if (this.shuttingDown) {
+        return;
+      }
+      await this.pollAndSchedule();
+      if (this.shuttingDown) {
+        return;
+      }
       this.log.info(`Mammotion polling every ${this.pollingSeconds}s`);
     } catch (error) {
       this.log.error(`Mammotion startup failed: ${(error as Error).message}`);
+      await this.client.stop();
+      this.scheduleRestart(error instanceof MammotionApiError ? error.retryAfterMs : 0);
+    } finally {
+      this.starting = false;
+    }
+  }
+
+  private scheduleRestart(retryAfterMs = 0): void {
+    if (this.pollTimer) {
+      clearTimeout(this.pollTimer);
+      this.pollTimer = undefined;
+    }
+    if (this.shuttingDown || this.restartTimer) {
+      return;
+    }
+    const delay = Math.max(this.restartDelayMs, retryAfterMs);
+    this.restartDelayMs = Math.min(this.restartDelayMs * 2, 600_000);
+    this.log.warn(`Reconnecting Mammotion API in ${delay / 1000}s`);
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = undefined;
+      void this.startup();
+    }, delay);
+    this.restartTimer.unref?.();
+  }
+
+  private schedulePoll(delayMs = this.pollingSeconds * 1000): void {
+    if (this.shuttingDown || this.restartTimer) {
+      return;
+    }
+    // Schedule after completion so slow requests cannot accumulate overlapping polls.
+    this.pollTimer = setTimeout(async () => {
+      this.pollTimer = undefined;
+      await this.pollAndSchedule();
+    }, delayMs);
+    this.pollTimer.unref?.();
+  }
+
+  private async pollAndSchedule(): Promise<void> {
+    try {
+      await this.pollOnce();
+      this.restartDelayMs = 10_000;
+      this.schedulePoll();
+    } catch (error) {
+      if (this.shuttingDown) {
+        return;
+      }
+      if (!(error instanceof MammotionApiError) && !(error instanceof MammotionStateError)) {
+        throw error;
+      }
+      // Failed telemetry must invalidate Home state, including the first poll.
+      // Retain the authenticated client and paired accessories while retrying.
+      await Promise.all([
+        ...Array.from(this.matterHandlers.values(), handler => handler.markUnavailable()),
+        ...Array.from(this.handlers.values(), handler => handler.markUnavailable()),
+      ]);
+      this.log.warn(`Polling failed: ${(error as Error).message}`);
+      const delay = Math.max(this.pollingSeconds * 1000, this.restartDelayMs,
+        error instanceof MammotionApiError ? error.retryAfterMs : 0);
+      this.restartDelayMs = Math.min(this.restartDelayMs * 2, 600_000);
+      this.schedulePoll(delay);
     }
   }
 
   private async shutdown(): Promise<void> {
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = undefined;
-    }
-
+    this.shuttingDown = true;
+    clearTimeout(this.pollTimer);
+    clearTimeout(this.restartTimer);
+    this.pollTimer = undefined;
+    this.restartTimer = undefined;
     await this.client.stop().catch((error: Error) => {
-      this.log.warn(`Bridge shutdown failed: ${error.message}`);
+      this.log.warn(`API shutdown failed: ${error.message}`);
     });
   }
 
   private async discoverAndSyncAccessories(): Promise<void> {
     const allDevices = await this.client.discoverDevices();
+    if (allDevices.length === 0 && this.accessories.length > 0) {
+      throw new Error('No mowers returned by the cloud; keeping cached HomeKit accessories');
+    }
     const devices = this.filterDevices(allDevices);
     const liveNames = new Set(devices.map(device => device.name));
 
@@ -160,6 +234,9 @@ export class MammotionPlatform implements DynamicPlatformPlugin {
     }
 
     const allDevices = await this.client.discoverDevices();
+    if (allDevices.length === 0 && this.cachedMatterAccessories.size > 0) {
+      throw new Error('No mowers returned by the cloud; keeping paired Matter accessories');
+    }
     const devices = this.filterDevices(allDevices);
     const liveUuids = new Set<string>();
     const toRegister: unknown[] = [];
@@ -178,13 +255,17 @@ export class MammotionPlatform implements DynamicPlatformPlugin {
       liveUuids.add(handler.uuid);
       handler.logReady();
 
-      if (!this.cachedMatterAccessories.has(handler.uuid)) {
-        toRegister.push(handler.toAccessory());
-      }
+      // Cache data contains no live command handlers. Homebridge reattaches
+      // registration to the restored endpoint with the same UUID and storage.
+      toRegister.push(handler.toAccessory());
     }
 
     if (toRegister.length > 0) {
       await matter.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, toRegister);
+      for (const accessory of toRegister) {
+        const uuid = (accessory as { UUID: string }).UUID;
+        this.cachedMatterAccessories.set(uuid, accessory);
+      }
       this.log.info(`Registered ${toRegister.length} Matter robotic vacuum accessory(s)`);
     }
 
@@ -255,6 +336,7 @@ export class MammotionPlatform implements DynamicPlatformPlugin {
   private getMatterApi(): null | {
     uuid: { generate: (input: string) => string };
     deviceTypes: { RoboticVacuumCleaner: unknown };
+    deviceRequirements?: { PowerSource: { PowerSourceServer: unknown } };
     registerPlatformAccessories: (pluginName: string, platformName: string, accessories: unknown[]) => Promise<void>;
     unregisterPlatformAccessories: (pluginName: string, platformName: string, accessories: unknown[]) => Promise<void>;
     updateAccessoryState: (

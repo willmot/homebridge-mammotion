@@ -1,11 +1,14 @@
 import type { Logger } from 'homebridge';
 
 import type { MammotionClient } from './mammotion-client';
-import type { MammotionDeviceInfo, MammotionState } from './types';
+import type { MammotionAction, MammotionDeviceInfo, MammotionState } from './types';
+
+type Composable = { with: (...features: unknown[]) => unknown };
 
 type MatterApi = {
   uuid: { generate: (input: string) => string };
   deviceTypes: { RoboticVacuumCleaner: unknown };
+  deviceRequirements?: { PowerSource: { PowerSourceServer: unknown } };
   updateAccessoryState: (
     uuid: string,
     cluster: string,
@@ -29,8 +32,6 @@ type MatterAccessoryLike = {
 };
 
 export class MammotionMatterVacuum {
-  private state: MammotionState;
-
   private readonly accessory: MatterAccessoryLike;
 
   constructor(
@@ -40,36 +41,31 @@ export class MammotionMatterVacuum {
     private readonly client: MammotionClient,
     uuidSeed: string,
   ) {
-    this.state = {
-      name: this.device.name,
-      online: false,
-      battery: 0,
-      chargeState: 0,
-      sysStatus: 0,
-      modeName: 'unknown',
-      areaProgress: 0,
-      hasError: false,
-      serviceAreas: [],
-      selectedAreaIds: [],
-      currentAreaId: null,
-    };
-
     const serial = device.serialNumber ?? device.name;
     const uuid = matterApi.uuid.generate(`mammotion-rvc:${uuidSeed}:${device.name}`);
 
     this.accessory = {
       UUID: uuid,
       displayName: device.name,
-      deviceType: matterApi.deviceTypes.RoboticVacuumCleaner,
+      deviceType: this.batteryDeviceType(),
       serialNumber: serial,
       manufacturer: 'Mammotion',
       model: device.model ?? 'Mower',
-      firmwareRevision: 'via PyMammotion',
+      firmwareRevision: 'via Mammotion API',
       hardwareRevision: '1.0',
       context: {
         deviceName: device.name,
       },
       clusters: {
+        powerSource: {
+          status: 0, order: 0, description: 'Mower battery',
+          // Homebridge publishes RVCs as standalone nodes with the mower on
+          // endpoint 1. Associate its battery explicitly with that endpoint.
+          endpointList: [1],
+          batPercentRemaining: null, batChargeLevel: 0, batChargeState: 0,
+          batReplacementNeeded: false, batReplaceability: 0, batPresent: true,
+          batFunctionalWhileCharging: false,
+        },
         rvcRunMode: {
           supportedModes: [
             { label: 'Idle', mode: 0, modeTags: [{ value: 16384 }] },
@@ -77,8 +73,8 @@ export class MammotionMatterVacuum {
           ],
           currentMode: 0,
         },
-        // RVC Clean Mode is optional and requires at least two modes. The mower
-        // exposes no selectable cleaning modes, so only advertise its run modes.
+        // Work parameters are read-only in the API. Do not advertise selectable
+        // clean modes that cannot be applied to the mower.
         rvcOperationalState: {
           operationalStateList: [
             { operationalStateId: 0 },
@@ -89,28 +85,31 @@ export class MammotionMatterVacuum {
             { operationalStateId: 65 },
             { operationalStateId: 66 },
           ],
-          operationalState: 66,
+          operationalState: 3,
+          operationalError: { errorStateId: 2, errorStateDetails: 'Mower telemetry unavailable' },
         },
       },
       handlers: {
         rvcRunMode: {
           changeToMode: async (request: { newMode: number }) => {
             if (request.newMode === 1) {
-              await this.client.command(this.device.name, 'start');
+              await this.command('start');
+            } else if (request.newMode === 0) {
+              await this.command('cancel');
             } else {
-              await this.client.command(this.device.name, 'dock');
+              throw new Error('Unsupported mower run mode');
             }
           },
         },
         rvcOperationalState: {
           pause: async () => {
-            await this.client.command(this.device.name, 'pause');
+            await this.command('pause');
           },
           resume: async () => {
-            await this.client.command(this.device.name, 'start');
+            await this.command('resume');
           },
           goHome: async () => {
-            await this.client.command(this.device.name, 'dock');
+            await this.command('dock');
           },
         },
       },
@@ -129,11 +128,28 @@ export class MammotionMatterVacuum {
     return this.device.name;
   }
 
-  async updateState(nextState: MammotionState): Promise<void> {
-    this.state = nextState;
+  async markUnavailable(): Promise<void> {
+    // Keep the last run mode; missing telemetry is not evidence that a task ended.
+    await this.matterApi.updateAccessoryState(this.uuid, 'powerSource', {
+      status: 0, batPercentRemaining: null, batChargeState: 0,
+    });
+    await this.matterApi.updateAccessoryState(this.uuid, 'rvcOperationalState', {
+      operationalState: 3,
+      operationalError: { errorStateId: 2, errorStateDetails: 'Mower telemetry unavailable' },
+    });
+  }
 
-    const runMode = this.isWorking(nextState) ? 1 : 0;
+  async updateState(nextState: MammotionState): Promise<void> {
+    // A paused task remains in Cleaning run mode; Idle means the task ended.
+    const runMode = this.isWorking(nextState) || this.isPaused(nextState) ? 1 : 0;
     const operationalState = this.toOperationalState(nextState);
+
+    await this.matterApi.updateAccessoryState(this.uuid, 'powerSource', {
+      status: nextState.online ? 1 : 0,
+      batPercentRemaining: nextState.online ? Math.round(nextState.battery * 2) : null,
+      batChargeLevel: nextState.battery <= 5 ? 2 : nextState.battery <= 20 ? 1 : 0,
+      batChargeState: !nextState.online ? 0 : nextState.chargeState === 0 ? 3 : nextState.battery >= 100 ? 2 : 1,
+    });
 
     await this.matterApi.updateAccessoryState(this.uuid, 'rvcRunMode', {
       currentMode: runMode,
@@ -141,7 +157,35 @@ export class MammotionMatterVacuum {
 
     await this.matterApi.updateAccessoryState(this.uuid, 'rvcOperationalState', {
       operationalState,
+      operationalError: this.operationalError(nextState),
     });
+  }
+
+  private batteryDeviceType(): unknown {
+    const deviceType = this.matterApi.deviceTypes.RoboticVacuumCleaner as Composable;
+    const powerSource = this.matterApi.deviceRequirements?.PowerSource.PowerSourceServer as Composable | undefined;
+    // Declare the behavior in the type too: cache restore must detect this
+    // structural upgrade, rather than reusing an endpoint without a battery.
+    return typeof powerSource?.with === 'function' && typeof deviceType?.with === 'function'
+      ? deviceType.with(powerSource.with('Battery', 'Rechargeable'))
+      : deviceType;
+  }
+
+  private async command(action: MammotionAction): Promise<void> {
+    const state = await this.client.command(this.device.name, action);
+    if (state) {
+      await this.updateState(state);
+    }
+  }
+
+  private operationalError(state: MammotionState): Record<string, unknown> {
+    if (!state.online) {
+      return { errorStateId: 3, errorStateDetails: 'Mower is offline' };
+    }
+    if (state.hasError) {
+      return { errorStateId: 2, errorStateDetails: 'Check the Mammotion app for the mower fault' };
+    }
+    return { errorStateId: 0 };
   }
 
   private toOperationalState(state: MammotionState): number {
@@ -162,7 +206,7 @@ export class MammotionMatterVacuum {
     }
 
     if (state.chargeState !== 0) {
-      return 65;
+      return state.battery >= 100 ? 66 : 65;
     }
 
     return 0;

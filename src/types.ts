@@ -1,10 +1,9 @@
 export interface MammotionPlatformConfig {
   platform: string;
   name?: string;
-  email: string;
-  password: string;
-  areaNameFallbacks?: Record<string, string[]>;
-  pythonPath?: string;
+  // Retained as an identity seed for existing Apple Home pairings, not login.
+  email?: string;
+  apiCredentialsPath: string;
   pollIntervalSeconds?: number;
   deviceFilter?: string[];
   offCommand?: 'pause' | 'dock' | 'cancel';
@@ -13,14 +12,8 @@ export interface MammotionPlatformConfig {
 
 export interface MammotionDeviceInfo {
   name: string;
-  iotId: string;
   model?: string;
   serialNumber?: string;
-}
-
-export interface MammotionServiceArea {
-  id: number;
-  name: string;
 }
 
 export interface MammotionState {
@@ -28,17 +21,10 @@ export interface MammotionState {
   online: boolean;
   battery: number;
   chargeState: number;
+  firmwareVersion?: string;
   sysStatus: number;
   modeName: string;
-  areaProgress: number;
   hasError: boolean;
-  serviceAreas: MammotionServiceArea[];
-  selectedAreaIds: number[];
-  currentAreaId: number | null;
 }
 
-export interface MammotionBridgeResponse<T = unknown> {
-  ok: boolean;
-  data?: T;
-  error?: string;
-}
+export type MammotionAction = 'start' | 'resume' | 'pause' | 'dock' | 'cancel';

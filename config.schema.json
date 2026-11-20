@@ -1,40 +1,17 @@
 {
   "pluginAlias": "Mammotion",
   "pluginType": "platform",
-  "headerDisplay": "Mammotion cloud control using PyMammotion. Use a dedicated Mammotion account shared to your mower(s).",
+  "headerDisplay": "Mammotion mower control using the official API.",
   "schema": {
     "type": "object",
     "required": [
-      "email",
-      "password"
+      "apiCredentialsPath"
     ],
     "properties": {
       "email": {
-        "title": "Email",
+        "title": "Account identity",
         "type": "string",
-        "description": "Mammotion account email (or account number if your account requires it)."
-      },
-      "password": {
-        "title": "Password",
-        "type": "string",
-        "format": "password"
-      },
-      "pythonPath": {
-        "title": "Python path",
-        "type": "string",
-        "default": "python3",
-        "description": "Python binary used to run the PyMammotion bridge."
-      },
-      "areaNameFallbacks": {
-        "title": "Area name fallbacks",
-        "type": "object",
-        "description": "Optional fallback area names when Mammotion does not return map/plan areas. Use mower device name as key (or '*' for default), e.g. {\"Luba-VAFFT58A\":[\"Front Lawn\",\"Back Lawn\"]}.",
-        "additionalProperties": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        }
+        "description": "When migrating, retain the previous email value to preserve accessory IDs."
       },
       "pollIntervalSeconds": {
         "title": "Polling interval (seconds)",
@@ -50,15 +27,21 @@
         "oneOf": [
           {
             "title": "Pause",
-            "enum": ["pause"]
+            "enum": [
+              "pause"
+            ]
           },
           {
             "title": "Dock",
-            "enum": ["dock"]
+            "enum": [
+              "dock"
+            ]
           },
           {
             "title": "Cancel",
-            "enum": ["cancel"]
+            "enum": [
+              "cancel"
+            ]
           }
         ]
       },
@@ -75,6 +58,11 @@
           "type": "string"
         },
         "description": "Optional list of exact device names to expose, e.g. Luba-123456."
+      },
+      "apiCredentialsPath": {
+        "title": "API credentials file",
+        "type": "string",
+        "description": "Absolute path to the private .env file containing MAMMOTION_CLIENT_ID and MAMMOTION_CLIENT_SECRET."
       }
     }
   }

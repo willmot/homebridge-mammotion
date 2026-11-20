@@ -270,11 +270,13 @@ export class MammotionPlatform implements DynamicPlatformPlugin {
     }
 
     const stale = Array.from(this.cachedMatterAccessories.entries())
-      .filter(([uuid]) => !liveUuids.has(uuid))
-      .map(([, accessory]) => accessory);
+      .filter(([uuid]) => !liveUuids.has(uuid));
 
     if (stale.length > 0) {
-      await matter.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, stale);
+      await matter.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, stale.map(([, accessory]) => accessory));
+      for (const [uuid] of stale) {
+        this.cachedMatterAccessories.delete(uuid);
+      }
       this.log.info(`Removed ${stale.length} stale Matter accessory(s)`);
     }
   }

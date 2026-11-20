@@ -90,6 +90,21 @@ describe('official API polling and pairing preservation', () => {
     expect(api.matter.registerPlatformAccessories.mock.calls[0][2][0].UUID).toBe('mammotion-rvc:Mammotion|test@example.com|Mammotion:fixture-mower');
     expect(client.discoverDevices).toHaveBeenCalledTimes(2);
   });
+
+  it('drops a stale Matter accessory from the cache after unregistering it', async () => {
+    const platform = new MammotionPlatform(log, config, api as unknown as API);
+    const staleAccessory = { UUID: 'stale-mower' };
+    platform.configureMatterAccessory(staleAccessory);
+
+    api.emit('didFinishLaunching');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(api.matter.unregisterPlatformAccessories).toHaveBeenCalledWith(
+      'homebridge-mammotion', 'Mammotion', [staleAccessory],
+    );
+
+    await platform['discoverAndSyncMatterAccessories']();
+    expect(api.matter.unregisterPlatformAccessories).toHaveBeenCalledTimes(1);
+  });
 });
 
 it('invalidates stale Matter state and recovers without authentication, registration or commands', async () => {

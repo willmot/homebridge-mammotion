@@ -1,214 +1,234 @@
-import { ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
-import { EventEmitter } from 'node:events';
-import { join } from 'node:path';
+import { readFile } from 'node:fs/promises';
+import { parseEnv } from 'node:util';
 
 import type { Logger } from 'homebridge';
+import type { MammotionAction, MammotionDeviceInfo, MammotionPlatformConfig, MammotionState } from './types';
+import { mapOfficialState } from './state-mapper';
 
-import type {
-  MammotionBridgeResponse,
-  MammotionDeviceInfo,
-  MammotionPlatformConfig,
-  MammotionState,
-} from './types';
-import {
-  bootstrapManagedPython,
-  managedVenvPythonPath,
-  probePython,
-  versionIsSupported,
-  versionLabel,
-} from './python-env';
+type Credentials = { clientId: string; clientSecret: string };
+type ApiMower = { id: string; name: string; model?: string };
+type Envelope<T> = { code: number; data: T; msg?: string };
 
-type Pending = {
-  resolve: (value: unknown) => void;
-  reject: (error: Error) => void;
-};
-
-export class MammotionClient extends EventEmitter {
-  private process?: ChildProcessWithoutNullStreams;
-  private nextId = 1;
-  private pending = new Map<number, Pending>();
-  private buffer = '';
-  private pythonPath: string;
-  private readonly userConfiguredPythonPath: boolean;
-
-  constructor(
-    private readonly log: Logger,
-    private readonly config: MammotionPlatformConfig,
-  ) {
-    super();
-    this.userConfiguredPythonPath = Boolean(config.pythonPath);
-    this.pythonPath = config.pythonPath ?? managedVenvPythonPath();
+export class MammotionApiError extends Error {
+  constructor(message: string, public readonly retryAfterMs = 0) {
+    super(message);
   }
+}
+
+export class MammotionClient {
+  private credentials?: Credentials;
+  private token?: { value: string; expiresAt: number };
+  private authorization?: Promise<string>;
+  private lifetime = new AbortController();
+  private readonly devices = new Map<string, ApiMower>();
+  private retryNotBefore = 0;
+
+  constructor(private readonly log: Logger, private readonly config: MammotionPlatformConfig) {}
 
   async start(): Promise<void> {
-    if (this.process) {
-      return;
+    this.lifetime = new AbortController();
+    const lifetime = this.lifetime;
+    const values = parseEnv(await readFile(this.config.apiCredentialsPath, 'utf8'));
+    if (lifetime.signal.aborted) {
+      throw new Error('Mammotion startup cancelled');
     }
-
-    await this.verifyPythonEnvironment();
-
-    const bridgePath = join(__dirname, 'python', 'bridge.py');
-    this.process = spawn(this.pythonPath, [bridgePath], {
-      stdio: 'pipe',
-      env: {
-        ...process.env,
-        PYTHONUNBUFFERED: '1',
-      },
-    });
-
-    this.process.stdout.on('data', (chunk: Buffer) => this.handleStdout(chunk));
-    this.process.stderr.on('data', (chunk: Buffer) => {
-      const text = chunk.toString('utf8').trim();
-      if (text.length > 0) {
-        if (text.includes('map areas=') || text.includes('get_area_name_list') || text.includes('start_map_sync')) {
-          this.log.info(`[bridge] ${text}`);
-        } else {
-          this.log.debug(`[bridge] ${text}`);
+    if (!values.MAMMOTION_CLIENT_ID || !values.MAMMOTION_CLIENT_SECRET) {
+      throw new Error('Set MAMMOTION_CLIENT_ID and MAMMOTION_CLIENT_SECRET in apiCredentialsPath');
+    }
+    this.credentials = { clientId: values.MAMMOTION_CLIENT_ID, clientSecret: values.MAMMOTION_CLIENT_SECRET };
+    const mowers = await this.request<ApiMower[]>('/v1/mowers');
+    if (!Array.isArray(mowers) || mowers.some(mower => !mower || typeof mower.id !== 'string' || !mower.id
+      || typeof mower.name !== 'string' || !mower.name)) {
+      throw new Error('Official API returned an invalid mower list');
+    }
+    this.devices.clear();
+    for (const mower of mowers) {
+      if (!this.config.deviceFilter?.length || this.config.deviceFilter.includes(mower.name)) {
+        if (this.devices.has(mower.name)) {
+          throw new Error('Official API returned duplicate mower names');
         }
+        this.devices.set(mower.name, mower);
       }
-    });
-
-    this.process.on('exit', (code, signal) => {
-      const error = new Error(`Bridge exited (code=${code ?? 'null'}, signal=${signal ?? 'null'})`);
-      for (const [, request] of this.pending) {
-        request.reject(error);
-      }
-      this.pending.clear();
-      this.process = undefined;
-      this.emit('exit', error);
-    });
-
-    await this.request('init', {
-      email: this.config.email,
-      password: this.config.password,
-      areaNameFallbacks: this.config.areaNameFallbacks ?? {},
-    });
+    }
+    this.log.info(`Using Mammotion official API (${this.devices.size} mower(s))`);
   }
 
   async stop(): Promise<void> {
-    if (!this.process) {
-      return;
-    }
-
-    await this.request('shutdown', {}).catch(() => undefined);
-    this.process.kill();
-    this.process = undefined;
+    this.lifetime.abort();
+    this.credentials = undefined;
+    this.token = undefined;
+    this.authorization = undefined;
   }
 
   async discoverDevices(): Promise<MammotionDeviceInfo[]> {
-    return this.request<MammotionDeviceInfo[]>('list_devices', {});
+    return Array.from(this.devices.values(), mower => ({
+      name: mower.name,
+      model: mower.model,
+      // Preserve the serial generated by the original PyMammotion bridge.
+      // API device IDs are transport identifiers, never Apple Home identity.
+      serialNumber: mower.name.includes('-') ? mower.name.slice(mower.name.indexOf('-') + 1) : mower.name,
+    }));
   }
 
   async pollStates(): Promise<MammotionState[]> {
-    return this.request<MammotionState[]>('poll', {});
+    return Promise.all(Array.from(this.devices.keys(), name => this.readState(name)));
   }
 
-  async command(deviceName: string, action: 'start' | 'pause' | 'dock' | 'cancel'): Promise<MammotionState> {
-    return this.request<MammotionState>('command', {
-      name: deviceName,
-      action,
-    });
-  }
-
-  private async request<T>(method: string, params: Record<string, unknown>): Promise<T> {
-    if (!this.process) {
-      throw new Error('Bridge is not running');
+  async command(name: string, action: MammotionAction): Promise<MammotionState | undefined> {
+    const mower = this.device(name);
+    // Stop, Pause and Return must remain available when telemetry is malformed.
+    // Start and Resume check connectivity; Start also chooses the action from status.
+    const before = action === 'start' || action === 'resume' ? await this.readState(name) : undefined;
+    if (before && !before.online) {
+      throw new Error('Mower is offline');
     }
+    if ((action === 'start' || action === 'resume') && before?.modeName === 'MODE_WORKING') {
+      return before;
+    }
+    const officialAction = action === 'start'
+      ? (before?.modeName === 'MODE_PAUSE' ? 'RESUME' : 'CMD_START')
+      : ({ resume: 'RESUME', pause: 'PAUSE', dock: 'RETURN', cancel: 'STOP' } as const)[action];
+    const result = await this.request<{ commandResult?: boolean; resultMessage?: string } | null | undefined>('/v1/mower/action', {
+      method: 'POST', body: JSON.stringify({ deviceId: mower.id, action: officialAction }),
+    });
+    // The vendor's successful action example has no data payload. An explicit
+    // negative acknowledgment still fails; neither response proves movement.
+    if (result?.commandResult === false) {
+      const detail = this.providerMessage(result.resultMessage);
+      throw new Error(`Official API rejected ${officialAction}${detail ? `: ${detail}` : ''}`);
+    }
+    if (result?.commandResult !== undefined && result.commandResult !== true) {
+      throw new Error(`Official API returned an invalid acknowledgment for ${officialAction}`);
+    }
+    this.log.info(`Official API accepted ${officialAction} for ${name}`);
+    // Never manufacture a state change from command acceptance. Device status
+    // can lag; regular polling supplies the actual result without replaying it.
+    try {
+      return await this.readState(name);
+    } catch {
+      this.log.warn('Mower command accepted; waiting for the next successful status poll');
+      return before;
+    }
+  }
 
-    const id = this.nextId++;
-    const payload = JSON.stringify({ id, method, params });
+  private device(name: string): ApiMower {
+    const mower = this.devices.get(name);
+    if (!mower) {
+      throw new Error('Unknown Mammotion mower');
+    }
+    return mower;
+  }
 
-    const responsePromise = new Promise<T>((resolve, reject) => {
-      this.pending.set(id, {
-        resolve: (value: unknown) => resolve(value as T),
-        reject,
+  private async readState(name: string): Promise<MammotionState> {
+    const mower = this.device(name);
+    const data = await this.request<unknown>(`/v1/mower/${encodeURIComponent(mower.id)}`);
+    // The guide uses a one-element array; the live API and OpenAPI use an object.
+    const detail = Array.isArray(data) ? data[0] : data;
+    if (detail && typeof detail === 'object') {
+      const identity = detail as { id?: unknown; name?: unknown };
+      if ((identity.id !== undefined && identity.id !== mower.id)
+        || (identity.name !== undefined && identity.name !== mower.name)) {
+        throw new Error('Official API returned a different mower identity');
+      }
+    }
+    return mapOfficialState(name, detail);
+  }
+
+  private async request<T>(path: string, options: RequestInit = {}, retried = false): Promise<T> {
+    if (Date.now() < this.retryNotBefore) {
+      throw new MammotionApiError('Mammotion API rate limit is still active', this.retryNotBefore - Date.now());
+    }
+    const token = await this.accessToken();
+    const response = await this.fetchResponse(`https://api-open.mammotion.com${path}`, {
+      ...options, headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'Accept-Language': 'en-US' },
+    });
+    // The live API can report auth failures inside an HTTP 200 envelope.
+    const body = response.status === 401 ? undefined : await this.responseJson<Envelope<T>>(response);
+    if (response.status === 401 || body?.code === 401) {
+      // Reads are safe to repeat after reauthorization. Writes are deliberately
+      // never retried: a lost response must not duplicate mower movement.
+      if (this.token?.value === token) {
+        this.token = undefined;
+      }
+      if (!retried && (!options.method || options.method === 'GET')) {
+        return this.request<T>(path, options, true);
+      }
+      throw new MammotionApiError('Mammotion API HTTP 401 (authorization expired or rejected)');
+    }
+    if (!body || ![0, 200].includes(body.code)) {
+      const detail = this.providerMessage(body?.msg, token);
+      throw new MammotionApiError(`Mammotion API rejected request (code ${typeof body?.code === 'number' ? body.code : 'unknown'})${detail ? `: ${detail}` : ''}`);
+    }
+    return body.data;
+  }
+
+  private providerMessage(value: unknown, token = this.token?.value): string {
+    let detail = typeof value === 'string' ? value : '';
+    // Provider errors can echo request data; redact before exposing their text.
+    for (const secret of [token, this.credentials?.clientId, this.credentials?.clientSecret, this.config.email]) {
+      if (secret) {
+        detail = detail.replaceAll(secret, '[redacted]');
+      }
+    }
+    return detail.replace(/\s+/g, ' ').trim().slice(0, 240);
+  }
+
+  private async accessToken(): Promise<string> {
+    if (this.token && this.token.expiresAt > Date.now()) {
+      return this.token.value;
+    }
+    if (!this.authorization) {
+      this.authorization = this.authorize().finally(() => { this.authorization = undefined; });
+    }
+    return this.authorization;
+  }
+
+  private async authorize(): Promise<string> {
+    if (!this.credentials) {
+      throw new Error('Mammotion client is not started');
+    }
+    const response = await this.fetchResponse('https://id.mammotion.com/oauth2/token', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ client_id: this.credentials.clientId, client_secret: this.credentials.clientSecret, grant_type: 'client_credentials' }),
+    });
+    const body = await this.responseJson<{ code?: number; data?: { access_token?: string; expires_in?: number }; access_token?: string; expires_in?: number }>(response);
+    if (body?.data && ![0, 200].includes(body.code ?? -1)) {
+      throw new Error('Mammotion API authorization rejected');
+    }
+    const token = body?.data ?? body;
+    if (!token || typeof token.access_token !== 'string' || !token.access_token
+      || !Number.isFinite(token.expires_in) || Number(token.expires_in) <= 0) {
+      throw new Error('Mammotion API returned an invalid authorization response');
+    }
+    this.token = { value: token.access_token, expiresAt: Date.now() + Math.max(1, Number(token.expires_in) - 30) * 1000 };
+    return this.token.value;
+  }
+
+  private async fetchResponse(url: string, options: RequestInit): Promise<Response> {
+    try {
+      return await fetch(url, {
+        ...options, redirect: 'error', signal: AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(15_000)]),
       });
-    });
-
-    this.process.stdin.write(`${payload}\n`);
-    return responsePromise;
-  }
-
-  private handleStdout(chunk: Buffer): void {
-    this.buffer += chunk.toString('utf8');
-
-    while (true) {
-      const lineEnd = this.buffer.indexOf('\n');
-      if (lineEnd < 0) {
-        return;
-      }
-
-      const line = this.buffer.slice(0, lineEnd).trim();
-      this.buffer = this.buffer.slice(lineEnd + 1);
-
-      if (line.length === 0) {
-        continue;
-      }
-
-      let message: { id?: number } & MammotionBridgeResponse;
-      try {
-        message = JSON.parse(line) as { id?: number } & MammotionBridgeResponse;
-      } catch (error) {
-        this.log.warn(`Failed to parse bridge message: ${line}`);
-        continue;
-      }
-
-      if (typeof message.id !== 'number') {
-        continue;
-      }
-
-      const request = this.pending.get(message.id);
-      if (!request) {
-        continue;
-      }
-
-      this.pending.delete(message.id);
-
-      if (!message.ok) {
-        request.reject(new Error(message.error ?? 'Unknown bridge error'));
-        continue;
-      }
-
-      request.resolve(message.data);
+    } catch {
+      throw new MammotionApiError('Mammotion API request failed or timed out; command outcome may be unknown');
     }
   }
 
-  private async verifyPythonEnvironment(): Promise<void> {
-    let probe = await probePython(this.pythonPath);
-    if (!probe.available || !versionIsSupported(probe) || !probe.hasPyMammotion) {
-      if (!this.userConfiguredPythonPath) {
-        this.log.info('Preparing managed Python environment for Mammotion bridge...');
-        this.pythonPath = await bootstrapManagedPython(this.log);
-        probe = await probePython(this.pythonPath);
-      } else if (!probe.available) {
-        this.log.warn(
-          `Configured pythonPath "${this.pythonPath}" is not executable in Homebridge runtime (${probe.error ?? 'unknown reason'}). Falling back to managed runtime.`,
-        );
-        this.pythonPath = await bootstrapManagedPython(this.log);
-        probe = await probePython(this.pythonPath);
-      } else if (!probe.hasPyMammotion) {
-        this.log.warn(
-          `Configured pythonPath "${probe.executable ?? this.pythonPath}" does not have module "pymammotion". Falling back to managed runtime.`,
-        );
-        this.pythonPath = await bootstrapManagedPython(this.log);
-        probe = await probePython(this.pythonPath);
-      }
+  private async responseJson<T>(response: Response): Promise<T> {
+    if (response.status === 429) {
+      const header = response.headers.get('retry-after');
+      const seconds = header === null ? 60 : Number(header);
+      const delay = Number.isFinite(seconds) ? Math.max(1000, seconds * 1000) : Math.max(1000, Date.parse(header ?? '') - Date.now() || 60_000);
+      this.retryNotBefore = Date.now() + delay;
+      throw new MammotionApiError('Mammotion API rate limit reached', delay);
     }
-
-    if (!probe.available) {
-      throw new Error(
-        `Cannot execute python interpreter "${this.pythonPath}" (${probe.error ?? 'unknown reason'}).`,
-      );
+    if (!response.ok) {
+      throw new MammotionApiError(`Mammotion API HTTP ${response.status}`);
     }
-
-    if (!versionIsSupported(probe)) {
-      throw new Error(
-        `Python ${versionLabel(probe)} at ${probe.executable ?? this.pythonPath} is unsupported. Use Python 3.10+ or remove "pythonPath" to use managed runtime.`,
-      );
-    }
-
-    if (!probe.hasPyMammotion) {
-      throw new Error('Managed runtime bootstrap completed but pymammotion is still unavailable.');
+    try {
+      return await response.json() as T;
+    } catch {
+      throw new Error('Mammotion API returned invalid JSON');
     }
   }
 }

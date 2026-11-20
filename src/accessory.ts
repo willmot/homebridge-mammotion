@@ -16,6 +16,7 @@ export class MammotionAccessory {
   private readonly switchService: Service;
   private readonly batteryService: Service;
   private state: MammotionState;
+  private available = false;
 
   constructor(
     private readonly platform: MammotionPlatform,
@@ -31,11 +32,7 @@ export class MammotionAccessory {
       chargeState: 0,
       sysStatus: 0,
       modeName: 'unknown',
-      areaProgress: 0,
       hasError: false,
-      serviceAreas: [],
-      selectedAreaIds: [],
-      currentAreaId: null,
     };
 
     const information = accessory.getService(this.platform.Service.AccessoryInformation)
@@ -46,7 +43,7 @@ export class MammotionAccessory {
       .setCharacteristic(this.platform.Characteristic.Model, device.model ?? 'Mower')
       .setCharacteristic(this.platform.Characteristic.SerialNumber, device.serialNumber ?? device.name)
       .setCharacteristic(this.platform.Characteristic.Name, device.name)
-      .setCharacteristic(this.platform.Characteristic.FirmwareRevision, 'via PyMammotion');
+      .setCharacteristic(this.platform.Characteristic.FirmwareRevision, 'via Mammotion API');
 
     this.switchService = accessory.getService(this.platform.Service.Switch)
       ?? accessory.addService(this.platform.Service.Switch);
@@ -59,15 +56,25 @@ export class MammotionAccessory {
     this.batteryService = accessory.getService(this.platform.Service.Battery)
       ?? accessory.addService(this.platform.Service.Battery);
 
-    this.updateState(this.state);
+    this.markUnavailable();
   }
 
   get deviceName(): string {
     return this.device.name;
   }
 
+  markUnavailable(): void {
+    this.available = false;
+    const failure = new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    this.switchService.updateCharacteristic(this.platform.Characteristic.On, failure);
+    this.switchService.updateCharacteristic(this.platform.Characteristic.StatusActive, false);
+    this.switchService.updateCharacteristic(this.platform.Characteristic.StatusFault, this.platform.Characteristic.StatusFault.GENERAL_FAULT);
+    this.batteryService.updateCharacteristic(this.platform.Characteristic.BatteryLevel, failure);
+  }
+
   updateState(nextState: MammotionState): void {
     this.state = nextState;
+    this.available = true;
 
     const on = this.isMowing(nextState);
     const battery = Math.max(0, Math.min(100, Math.round(nextState.battery)));
@@ -97,6 +104,9 @@ export class MammotionAccessory {
   }
 
   private handleOnGet(): CharacteristicValue {
+    if (!this.available) {
+      throw new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    }
     return this.isMowing(this.state);
   }
 
@@ -108,7 +118,9 @@ export class MammotionAccessory {
       : (this.platform.config.offCommand ?? 'pause');
 
     const updated = await this.client.command(this.device.name, action);
-    this.updateState(updated);
+    if (updated) {
+      this.updateState(updated);
+    }
   }
 
   private isMowing(state: MammotionState): boolean {
